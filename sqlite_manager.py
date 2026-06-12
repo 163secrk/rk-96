@@ -49,6 +49,11 @@ class SQLiteManager:
         self._completion_start = None
         self._highlight_job = None
 
+        self.page_size = 100
+        self.current_page = 1
+        self.total_rows = 0
+        self._paged_data = False
+
         self.create_menu()
         self.create_toolbar()
         self.create_main_layout()
@@ -544,6 +549,41 @@ class SQLiteManager:
         data_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
         data_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
 
+        pager_frame = ttk.Frame(parent)
+        pager_frame.pack(fill=tk.X, pady=(5, 0))
+
+        ttk.Label(pager_frame, text="每页:").pack(side=tk.LEFT)
+        self.page_size_var = tk.StringVar(value="100")
+        page_size_combo = ttk.Combobox(pager_frame, textvariable=self.page_size_var,
+                                       values=["50", "100", "200", "500", "1000"],
+                                       state="readonly", width=6)
+        page_size_combo.pack(side=tk.LEFT, padx=(2, 10))
+        page_size_combo.bind("<<ComboboxSelected>>", self._on_page_size_change)
+
+        self.btn_first = ttk.Button(pager_frame, text="首页", command=self._goto_first_page, state="disabled")
+        self.btn_first.pack(side=tk.LEFT, padx=1)
+        self.btn_prev = ttk.Button(pager_frame, text="上一页", command=self._goto_prev_page, state="disabled")
+        self.btn_prev.pack(side=tk.LEFT, padx=1)
+
+        self.page_label = ttk.Label(pager_frame, text="第 0 / 0 页")
+        self.page_label.pack(side=tk.LEFT, padx=10)
+
+        self.btn_next = ttk.Button(pager_frame, text="下一页", command=self._goto_next_page, state="disabled")
+        self.btn_next.pack(side=tk.LEFT, padx=1)
+        self.btn_last = ttk.Button(pager_frame, text="末页", command=self._goto_last_page, state="disabled")
+        self.btn_last.pack(side=tk.LEFT, padx=1)
+
+        ttk.Label(pager_frame, text="  跳转到:").pack(side=tk.LEFT)
+        self.goto_page_var = tk.StringVar()
+        self.goto_entry = ttk.Entry(pager_frame, textvariable=self.goto_page_var, width=5)
+        self.goto_entry.pack(side=tk.LEFT, padx=2)
+        self.goto_entry.bind("<Return>", self._on_goto_page)
+        self.btn_goto = ttk.Button(pager_frame, text="跳转", command=self._on_goto_page, state="disabled")
+        self.btn_goto.pack(side=tk.LEFT, padx=1)
+
+        self.total_label = ttk.Label(pager_frame, text="共 0 行")
+        self.total_label.pack(side=tk.RIGHT)
+
         info_frame = ttk.Frame(parent)
         info_frame.pack(fill=tk.X, pady=5)
         self.status_label = ttk.Label(info_frame, text="就绪")
@@ -683,36 +723,139 @@ class SQLiteManager:
             return
 
         try:
-            columns, rows = self.db.get_table_data(table_name)
-            self.display_data(columns, rows)
             self.current_table = table_name
-            self.status_label.config(text=f"表数据: {table_name} ({len(rows)} 行)")
+            self.current_page = 1
+            self._paged_data = True
+            self._load_paged_data()
 
         except Exception as e:
             messagebox.showerror("错误", f"获取表数据失败: {str(e)}")
+
+    def _load_paged_data(self):
+        if not self.current_table or not self.db.is_connected():
+            return
+
+        self.page_size = int(self.page_size_var.get())
+        offset = (self.current_page - 1) * self.page_size
+
+        columns, rows, total = self.db.get_table_data_paged(
+            self.current_table, limit=self.page_size, offset=offset
+        )
+        self.total_rows = total
+        self.display_data(columns, rows)
+        self._update_pager()
+        self.status_label.config(
+            text=f"表数据: {self.current_table} ({total} 行, 第 {self.current_page} 页)"
+        )
+
+    def _update_pager(self):
+        if not self._paged_data:
+            self.page_label.config(text=f"共 {self.total_rows} 行")
+            self.total_label.config(text="")
+            self.btn_first.config(state="disabled")
+            self.btn_prev.config(state="disabled")
+            self.btn_next.config(state="disabled")
+            self.btn_last.config(state="disabled")
+            self.btn_goto.config(state="disabled")
+            return
+
+        total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+
+        self.page_label.config(text=f"第 {self.current_page} / {total_pages} 页")
+        self.total_label.config(text=f"共 {self.total_rows} 行")
+
+        has_prev = self.current_page > 1
+        has_next = self.current_page < total_pages
+
+        self.btn_first.config(state="normal" if has_prev else "disabled")
+        self.btn_prev.config(state="normal" if has_prev else "disabled")
+        self.btn_next.config(state="normal" if has_next else "disabled")
+        self.btn_last.config(state="normal" if has_next else "disabled")
+        self.btn_goto.config(state="normal" if total_pages > 1 else "disabled")
+
+    def _goto_first_page(self):
+        if self.current_page > 1:
+            self.current_page = 1
+            self._load_paged_data()
+
+    def _goto_prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self._load_paged_data()
+
+    def _goto_next_page(self):
+        total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+        if self.current_page < total_pages:
+            self.current_page += 1
+            self._load_paged_data()
+
+    def _goto_last_page(self):
+        total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+        if self.current_page < total_pages:
+            self.current_page = total_pages
+            self._load_paged_data()
+
+    def _on_page_size_change(self, event=None):
+        self.page_size = int(self.page_size_var.get())
+        self.current_page = 1
+        if self._paged_data and self.current_table:
+            self._load_paged_data()
+
+    def _on_goto_page(self, event=None):
+        try:
+            page = int(self.goto_page_var.get())
+            total_pages = max(1, (self.total_rows + self.page_size - 1) // self.page_size)
+            if 1 <= page <= total_pages:
+                self.current_page = page
+                self._load_paged_data()
+            else:
+                messagebox.showwarning("警告", f"页码必须在 1 到 {total_pages} 之间")
+        except ValueError:
+            messagebox.showwarning("警告", "请输入有效的页码")
+        self.goto_page_var.set("")
 
     def display_data(self, columns, rows):
         self.clear_data_table()
 
         self.data_tree["columns"] = columns
+        sample_rows = rows[:50]
         for col in columns:
             self.data_tree.heading(col, text=col)
             max_width = max(len(str(col)), 100)
-            for row in rows:
-                max_width = max(max_width, len(str(row[col])) if col in row.keys() else 10)
+            for row in sample_rows:
+                try:
+                    val = str(row[col]) if row[col] is not None else ""
+                    max_width = max(max_width, len(val))
+                except (KeyError, IndexError):
+                    pass
             self.data_tree.column(col, width=min(max_width * 8, 300), stretch=True)
 
-        for i, row in enumerate(rows):
-            values = [str(row[col]) if row[col] is not None else "" for col in columns]
-            tag = "even" if i % 2 == 0 else "odd"
-            self.data_tree.insert("", tk.END, values=values, tags=(tag,))
+        self._batch_insert_rows(columns, rows, 0)
 
         self.data_tree.tag_configure("even", background="#f0f0f0")
         self.data_tree.tag_configure("odd", background="#ffffff")
 
+    def _batch_insert_rows(self, columns, rows, start_idx, batch_size=50):
+        end_idx = min(start_idx + batch_size, len(rows))
+        for i in range(start_idx, end_idx):
+            row = rows[i]
+            values = []
+            for col in columns:
+                try:
+                    val = row[col]
+                except (KeyError, IndexError):
+                    val = None
+                values.append(str(val) if val is not None else "")
+            tag = "even" if i % 2 == 0 else "odd"
+            self.data_tree.insert("", tk.END, values=values, tags=(tag,))
+
+        if end_idx < len(rows):
+            self.root.after(10, lambda: self._batch_insert_rows(columns, rows, end_idx, batch_size))
+
     def clear_data_table(self):
         self.data_tree.delete(*self.data_tree.get_children())
         self.data_tree["columns"] = ()
+        self._paged_data = False
 
     def execute_sql(self):
         if not self.db.is_connected():
@@ -727,14 +870,18 @@ class SQLiteManager:
         try:
             columns, rows, count = self.db.execute_sql(sql)
 
-            if sql.strip().upper().startswith("SELECT") or sql.strip().upper().startswith("PRAGMA"):
+            if rows is not None and columns is not None:
                 if rows:
+                    self._paged_data = False
+                    self.total_rows = count
                     self.display_data(columns, rows)
+                    self._update_pager()
                     self.status_label.config(text=f"查询成功: {count} 行")
                 else:
                     self.clear_data_table()
                     self.status_label.config(text="查询成功: 无结果")
             else:
+                self.clear_data_table()
                 self.status_label.config(text=f"执行成功: 影响 {count} 行")
                 self.refresh_tree()
 

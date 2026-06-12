@@ -111,20 +111,150 @@ class DBConnection:
         columns = [desc[0] for desc in cursor.description]
         return columns, rows
 
+    def _split_sql_statements(self, sql):
+        statements = []
+        current = []
+        in_single_quote = False
+        in_double_quote = False
+        in_line_comment = False
+        in_block_comment = False
+        i = 0
+        sql_len = len(sql)
+
+        while i < sql_len:
+            ch = sql[i]
+
+            if in_line_comment:
+                if ch == '\n':
+                    in_line_comment = False
+                current.append(ch)
+                i += 1
+                continue
+
+            if in_block_comment:
+                if ch == '*' and i + 1 < sql_len and sql[i + 1] == '/':
+                    in_block_comment = False
+                    current.append(ch)
+                    current.append(sql[i + 1])
+                    i += 2
+                    continue
+                current.append(ch)
+                i += 1
+                continue
+
+            if in_single_quote:
+                if ch == "'" and i + 1 < sql_len and sql[i + 1] == "'":
+                    current.append(ch)
+                    current.append(sql[i + 1])
+                    i += 2
+                    continue
+                if ch == "'":
+                    in_single_quote = False
+                current.append(ch)
+                i += 1
+                continue
+
+            if in_double_quote:
+                if ch == '"':
+                    in_double_quote = False
+                current.append(ch)
+                i += 1
+                continue
+
+            if ch == '-' and i + 1 < sql_len and sql[i + 1] == '-':
+                in_line_comment = True
+                current.append(ch)
+                current.append(sql[i + 1])
+                i += 2
+                continue
+
+            if ch == '/' and i + 1 < sql_len and sql[i + 1] == '*':
+                in_block_comment = True
+                current.append(ch)
+                current.append(sql[i + 1])
+                i += 2
+                continue
+
+            if ch == "'":
+                in_single_quote = True
+                current.append(ch)
+                i += 1
+                continue
+
+            if ch == '"':
+                in_double_quote = True
+                current.append(ch)
+                i += 1
+                continue
+
+            if ch == ';':
+                current.append(ch)
+                stmt = ''.join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
+
+            current.append(ch)
+            i += 1
+
+        if current:
+            stmt = ''.join(current).strip()
+            if stmt:
+                statements.append(stmt)
+
+        return statements
+
     def execute_sql(self, sql):
         if not self.conn:
             raise Exception("未连接到数据库")
-        cursor = self.conn.cursor()
-        cursor.execute(sql)
-        if sql.strip().upper().startswith("SELECT") or sql.strip().upper().startswith("PRAGMA"):
-            rows = cursor.fetchall()
-            if rows:
-                columns = [desc[0] for desc in cursor.description]
-                return columns, rows, len(rows)
+
+        statements = self._split_sql_statements(sql)
+        if not statements:
             return None, None, 0
+
+        cursor = self.conn.cursor()
+        last_columns = None
+        last_rows = None
+        total_rowcount = 0
+        has_result = False
+
+        for stmt in statements:
+            stmt_upper = stmt.strip().upper()
+            is_query = stmt_upper.startswith("SELECT") or stmt_upper.startswith("PRAGMA")
+
+            cursor.execute(stmt)
+
+            if is_query:
+                rows = cursor.fetchall()
+                if rows:
+                    last_columns = [desc[0] for desc in cursor.description]
+                    last_rows = rows
+                    has_result = True
+            else:
+                total_rowcount += cursor.rowcount if cursor.rowcount > 0 else 0
+
+        self.conn.commit()
+
+        if has_result and last_rows is not None:
+            return last_columns, last_rows, len(last_rows)
         else:
-            self.conn.commit()
-            return None, None, cursor.rowcount
+            return None, None, total_rowcount
+
+    def get_table_data_paged(self, table_name, limit=100, offset=0):
+        if not self.conn:
+            return None, None, 0
+        cursor = self.conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {self.quote_identifier(table_name)}")
+        total = cursor.fetchone()[0]
+        cursor.execute(
+            f"SELECT * FROM {self.quote_identifier(table_name)} LIMIT ? OFFSET ?",
+            (limit, offset)
+        )
+        rows = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        return columns, rows, total
 
     def rollback(self):
         if self.conn:
