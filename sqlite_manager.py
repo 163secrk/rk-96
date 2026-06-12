@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sqlite3
 import os
+import csv
+import json
 from db_connection import DBConnection
 from er_diagram_window import ERDiagramWindow
 
@@ -13,6 +15,7 @@ class SQLiteManager:
         self.root.geometry("1200x800")
 
         self.db = DBConnection()
+        self.current_table = None
 
         self.create_menu()
         self.create_toolbar()
@@ -48,6 +51,17 @@ class SQLiteManager:
         ttk.Button(toolbar, text="刷新", command=self.refresh_tree).pack(side=tk.LEFT, padx=2)
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
         ttk.Button(toolbar, text="ER图", command=self.show_er_diagram).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=5)
+
+        ttk.Label(toolbar, text="格式:").pack(side=tk.LEFT, padx=(5, 2))
+        self.format_var = tk.StringVar(value="CSV")
+        format_combo = ttk.Combobox(toolbar, textvariable=self.format_var,
+                                    values=["CSV", "JSON", "SQL INSERT"],
+                                    state="readonly", width=12)
+        format_combo.pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(toolbar, text="导入", command=self.import_data).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="导出", command=self.export_data).pack(side=tk.LEFT, padx=2)
 
     def create_main_layout(self):
         main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -258,6 +272,7 @@ class SQLiteManager:
         try:
             columns, rows = self.db.get_table_data(table_name)
             self.display_data(columns, rows)
+            self.current_table = table_name
             self.status_label.config(text=f"表数据: {table_name} ({len(rows)} 行)")
 
         except Exception as e:
@@ -323,8 +338,251 @@ class SQLiteManager:
             return
         ERDiagramWindow(self.root, self.db)
 
+    def export_data(self):
+        if not self.db.is_connected():
+            messagebox.showwarning("警告", "请先打开数据库")
+            return
+
+        if not self.current_table:
+            messagebox.showwarning("警告", "请先在左侧选中并双击打开一个表")
+            return
+
+        fmt = self.format_var.get()
+        if fmt == "CSV":
+            self._export_csv()
+        elif fmt == "JSON":
+            self._export_json()
+        elif fmt == "SQL INSERT":
+            self._export_sql_insert()
+
+    def _export_csv(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            title=f"导出 {self.current_table} 为 CSV"
+        )
+        if not filename:
+            return
+
+        try:
+            columns, rows = self.db.get_table_data(self.current_table)
+            with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                writer.writerow(columns)
+                for row in rows:
+                    writer.writerow([row[col] for col in columns])
+            self.status_label.config(text=f"导出成功: {filename} ({len(rows)} 行)")
+            messagebox.showinfo("成功", f"导出成功!\n文件: {filename}\n共 {len(rows)} 行数据")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {str(e)}")
+
+    def _export_json(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            title=f"导出 {self.current_table} 为 JSON"
+        )
+        if not filename:
+            return
+
+        try:
+            columns, rows = self.db.get_table_data(self.current_table)
+            data = []
+            for row in rows:
+                data.append({col: row[col] for col in columns})
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+            self.status_label.config(text=f"导出成功: {filename} ({len(rows)} 行)")
+            messagebox.showinfo("成功", f"导出成功!\n文件: {filename}\n共 {len(rows)} 行数据")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {str(e)}")
+
+    def _export_sql_insert(self):
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".sql",
+            filetypes=[("SQL 文件", "*.sql"), ("所有文件", "*.*")],
+            title=f"导出 {self.current_table} 为 SQL INSERT"
+        )
+        if not filename:
+            return
+
+        try:
+            columns, rows = self.db.get_table_data(self.current_table)
+            table_name = self.current_table
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(f"-- 导出表: {table_name}\n")
+                f.write(f"-- 记录数: {len(rows)}\n\n")
+                for row in rows:
+                    cols = ", ".join([f'"{col}"' for col in columns])
+                    values = []
+                    for col in columns:
+                        val = row[col]
+                        if val is None:
+                            values.append("NULL")
+                        elif isinstance(val, (int, float)):
+                            values.append(str(val))
+                        else:
+                            escaped = str(val).replace("'", "''")
+                            values.append(f"'{escaped}'")
+                    values_str = ", ".join(values)
+                    f.write(f'INSERT INTO "{table_name}" ({cols}) VALUES ({values_str});\n')
+            self.status_label.config(text=f"导出成功: {filename} ({len(rows)} 行)")
+            messagebox.showinfo("成功", f"导出成功!\n文件: {filename}\n共 {len(rows)} 行数据")
+        except Exception as e:
+            messagebox.showerror("错误", f"导出失败: {str(e)}")
+
+    def import_data(self):
+        if not self.db.is_connected():
+            messagebox.showwarning("警告", "请先打开数据库")
+            return
+
+        if not self.current_table:
+            messagebox.showwarning("警告", "请先在左侧选中并双击打开一个目标表")
+            return
+
+        fmt = self.format_var.get()
+        if fmt == "CSV":
+            self._import_csv()
+        elif fmt == "JSON":
+            self._import_json()
+        elif fmt == "SQL INSERT":
+            self._import_sql_insert()
+
+    def _import_csv(self):
+        filename = filedialog.askopenfilename(
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+            title=f"导入 CSV 到 {self.current_table}"
+        )
+        if not filename:
+            return
+
+        try:
+            table_cols, _ = self.db.get_table_columns(self.current_table)
+            col_names = [col["name"] for col in table_cols]
+
+            with open(filename, "r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                csv_cols = reader.fieldnames
+
+                if not csv_cols:
+                    raise Exception("CSV 文件为空或没有表头")
+
+                count = 0
+                cursor = self.db.conn.cursor()
+                table_name = self.current_table
+
+                for row in reader:
+                    cols = []
+                    placeholders = []
+                    values = []
+                    for col in csv_cols:
+                        if col in col_names:
+                            cols.append(f'"{col}"')
+                            placeholders.append("?")
+                            val = row[col]
+                            if val == "":
+                                values.append(None)
+                            else:
+                                values.append(val)
+                    if cols:
+                        sql = f'INSERT INTO "{table_name}" ({", ".join(cols)}) VALUES ({", ".join(placeholders)})'
+                        cursor.execute(sql, values)
+                        count += 1
+
+                self.db.conn.commit()
+
+            self.refresh_tree()
+            if self.current_table:
+                self.show_table_data(self.current_table)
+            self.status_label.config(text=f"导入成功: {filename} ({count} 行)")
+            messagebox.showinfo("成功", f"导入成功!\n文件: {filename}\n共导入 {count} 行数据")
+        except Exception as e:
+            self.db.rollback()
+            messagebox.showerror("错误", f"导入失败: {str(e)}")
+
+    def _import_json(self):
+        filename = filedialog.askopenfilename(
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            title=f"导入 JSON 到 {self.current_table}"
+        )
+        if not filename:
+            return
+
+        try:
+            table_cols, _ = self.db.get_table_columns(self.current_table)
+            col_names = [col["name"] for col in table_cols]
+
+            with open(filename, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if not isinstance(data, list):
+                raise Exception("JSON 文件必须是数组格式")
+
+            count = 0
+            cursor = self.db.conn.cursor()
+            table_name = self.current_table
+
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                cols = []
+                placeholders = []
+                values = []
+                for key, val in row.items():
+                    if key in col_names:
+                        cols.append(f'"{key}"')
+                        placeholders.append("?")
+                        values.append(val)
+                if cols:
+                    sql = f'INSERT INTO "{table_name}" ({", ".join(cols)}) VALUES ({", ".join(placeholders)})'
+                    cursor.execute(sql, values)
+                    count += 1
+
+            self.db.conn.commit()
+
+            self.refresh_tree()
+            if self.current_table:
+                self.show_table_data(self.current_table)
+            self.status_label.config(text=f"导入成功: {filename} ({count} 行)")
+            messagebox.showinfo("成功", f"导入成功!\n文件: {filename}\n共导入 {count} 行数据")
+        except Exception as e:
+            self.db.rollback()
+            messagebox.showerror("错误", f"导入失败: {str(e)}")
+
+    def _import_sql_insert(self):
+        filename = filedialog.askopenfilename(
+            filetypes=[("SQL 文件", "*.sql"), ("所有文件", "*.*")],
+            title=f"执行 SQL INSERT 文件到 {self.current_table}"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "r", encoding="utf-8") as f:
+                sql_content = f.read()
+
+            cursor = self.db.conn.cursor()
+            count = 0
+            statements = [s.strip() for s in sql_content.split(";") if s.strip()]
+
+            for sql in statements:
+                if sql.upper().startswith("INSERT"):
+                    cursor.execute(sql)
+                    count += cursor.rowcount
+
+            self.db.conn.commit()
+
+            self.refresh_tree()
+            if self.current_table:
+                self.show_table_data(self.current_table)
+            self.status_label.config(text=f"导入成功: {filename} ({count} 行)")
+            messagebox.showinfo("成功", f"导入成功!\n文件: {filename}\n共影响 {count} 行")
+        except Exception as e:
+            self.db.rollback()
+            messagebox.showerror("错误", f"导入失败: {str(e)}")
+
     def show_about(self):
-        messagebox.showinfo("关于", "SQLite 数据库管理器\n\n使用 Python Tkinter 开发\n功能: 数据库管理、表结构浏览、数据查询、SQL执行")
+        messagebox.showinfo("关于", "SQLite 数据库管理器\n\n使用 Python Tkinter 开发\n功能: 数据库管理、表结构浏览、数据查询、SQL执行、数据导入导出")
 
     def on_closing(self):
         self.close_database()
