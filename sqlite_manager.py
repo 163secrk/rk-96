@@ -2,10 +2,37 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import sqlite3
 import os
+import re
 import csv
 import json
 from db_connection import DBConnection
 from er_diagram_window import ERDiagramWindow
+
+SQL_KEYWORDS = {
+    "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET",
+    "DELETE", "CREATE", "TABLE", "DROP", "ALTER", "ADD", "COLUMN", "INDEX",
+    "VIEW", "TRIGGER", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "CROSS",
+    "ON", "AND", "OR", "NOT", "IN", "IS", "NULL", "LIKE", "BETWEEN",
+    "EXISTS", "DISTINCT", "ALL", "AS", "ORDER", "BY", "GROUP", "HAVING",
+    "LIMIT", "OFFSET", "UNION", "ALL", "ASC", "DESC", "PRIMARY", "KEY",
+    "FOREIGN", "REFERENCES", "UNIQUE", "CHECK", "DEFAULT", "CONSTRAINT",
+    "IF", "ELSE", "BEGIN", "END", "CASE", "WHEN", "THEN", "REPLACE",
+    "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC", "BOOLEAN", "VARCHAR",
+    "CHAR", "DATETIME", "DATE", "TIME", "TIMESTAMP", "AUTOINCREMENT",
+    "CONFLICT", "ABORT", "FAIL", "IGNORE", "REPLACE", "ROLLBACK",
+    "ATTACH", "DETACH", "DATABASE", "VACUUM", "REINDEX", "EXPLAIN",
+    "QUERY", "PLAN", "ANALYZE", "PRAGMA", "TRANSACTION", "COMMIT",
+    "SAVEPOINT", "RELEASE", "GLOB", "MATCH", "REGEXP", "OVER",
+    "PARTITION", "WINDOW", "ROW", "ROWS", "RANGE", "UNBOUNDED",
+    "PRECEDING", "FOLLOWING", "CURRENT", "FILTER", "WITH", "RECURSIVE",
+    "EXCEPT", "INTERSECT", "NATURAL", "USING", "FULL", "CAST",
+    "COLLATE", "ESCAPE", "RAISE", "QUOTE", "TOTAL", "COUNT", "SUM",
+    "AVG", "MAX", "MIN", "GROUP_CONCAT", "ABS", "ROUND", "UPPER",
+    "LOWER", "LENGTH", "SUBSTR", "TRIM", "LTRIM", "RTRIM", "REPLACE",
+    "COALESCE", "IFNULL", "IIF", "TYPEOF", "LAST_INSERT_ROWID",
+    "CHANGES", "TOTAL_CHANGES", "RANDOM", "ZEROBLOB", "HEX", "UNHEX",
+    "NULLIF", "LIKELY", "UNLIKELY", "LIKELIHOOD",
+}
 
 
 class SQLiteManager:
@@ -16,6 +43,11 @@ class SQLiteManager:
 
         self.db = DBConnection()
         self.current_table = None
+        self._completion_window = None
+        self._completion_listbox = None
+        self._completion_candidates = []
+        self._completion_start = None
+        self._highlight_job = None
 
         self.create_menu()
         self.create_toolbar()
@@ -104,12 +136,26 @@ class SQLiteManager:
         self.create_data_table(data_frame)
 
     def create_sql_editor(self, parent):
-        self.sql_text = tk.Text(parent, height=8, font=("Consolas", 10))
-        sql_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.sql_text.yview)
-        self.sql_text.configure(yscrollcommand=sql_scroll.set)
+        text_frame = ttk.Frame(parent)
+        text_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.sql_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sql_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.sql_text = tk.Text(text_frame, height=8, font=("Consolas", 10),
+                                undo=True, wrap=tk.NONE)
+        sql_scroll_y = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.sql_text.yview)
+        sql_scroll_x = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=self.sql_text.xview)
+        self.sql_text.configure(yscrollcommand=sql_scroll_y.set, xscrollcommand=sql_scroll_x.set)
+
+        self.sql_text.grid(row=0, column=0, sticky="nsew")
+        sql_scroll_y.grid(row=0, column=1, sticky="ns")
+        sql_scroll_x.grid(row=1, column=0, sticky="ew")
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(0, weight=1)
+
+        self.sql_text.tag_configure("keyword", foreground="#0000FF", font=("Consolas", 10, "bold"))
+        self.sql_text.tag_configure("string", foreground="#A31515")
+        self.sql_text.tag_configure("number", foreground="#098658")
+        self.sql_text.tag_configure("comment", foreground="#008000", font=("Consolas", 10, "italic"))
+        self.sql_text.tag_configure("table_ref", foreground="#6F42C1")
 
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=5)
@@ -117,6 +163,373 @@ class SQLiteManager:
         ttk.Button(btn_frame, text="清空", command=self.clear_sql).pack(side=tk.LEFT, padx=2)
 
         self.root.bind("<F5>", lambda e: self.execute_sql())
+
+        self.sql_text.bind("<KeyRelease>", self._on_sql_key_release)
+        self.sql_text.bind("<Tab>", self._on_completion_tab)
+        self.sql_text.bind("<Return>", self._on_completion_return)
+        self.sql_text.bind("<Up>", self._on_completion_up)
+        self.sql_text.bind("<Down>", self._on_completion_down)
+        self.sql_text.bind("<Escape>", self._on_completion_escape)
+        self.sql_text.bind("<FocusOut>", self._on_sql_focus_out)
+
+    def _apply_syntax_highlight(self):
+        if self._highlight_job:
+            self.root.after_cancel(self._highlight_job)
+
+        self._highlight_job = self.root.after(50, self._do_apply_highlight)
+
+    def _do_apply_highlight(self):
+        self._highlight_job = None
+        self.sql_text.tag_remove("keyword", "1.0", tk.END)
+        self.sql_text.tag_remove("string", "1.0", tk.END)
+        self.sql_text.tag_remove("number", "1.0", tk.END)
+        self.sql_text.tag_remove("comment", "1.0", tk.END)
+        self.sql_text.tag_remove("table_ref", "1.0", tk.END)
+
+        content = self.sql_text.get("1.0", tk.END)
+        lines = content.split("\n")
+        in_block_comment = False
+
+        for line_idx, line in enumerate(lines):
+            line_start = f"{line_idx + 1}.0"
+
+            if in_block_comment:
+                end_pos = line.find("*/")
+                if end_pos != -1:
+                    in_block_comment = False
+                    self.sql_text.tag_add("comment", line_start, f"{line_idx + 1}.{end_pos + 2}")
+                    rest = line[end_pos + 2:]
+                    self._highlight_line(line_idx + 1, end_pos + 2, rest)
+                else:
+                    self.sql_text.tag_add("comment", line_start, f"{line_idx + 1}.end")
+                continue
+
+            block_start = line.find("/*")
+            if block_start != -1:
+                block_end = line.find("*/", block_start + 2)
+                if block_end != -1:
+                    before = line[:block_start]
+                    comment_part = line[block_start:block_end + 2]
+                    after = line[block_end + 2:]
+                    self._highlight_line(line_idx + 1, 0, before)
+                    self.sql_text.tag_add("comment", f"{line_idx + 1}.{block_start}", f"{line_idx + 1}.{block_end + 2}")
+                    self._highlight_line(line_idx + 1, block_end + 2, after)
+                    continue
+                else:
+                    before = line[:block_start]
+                    self._highlight_line(line_idx + 1, 0, before)
+                    self.sql_text.tag_add("comment", f"{line_idx + 1}.{block_start}", f"{line_idx + 1}.end")
+                    in_block_comment = True
+                    continue
+
+            stripped = line.lstrip()
+            if stripped.startswith("--"):
+                self.sql_text.tag_add("comment", line_start, f"{line_idx + 1}.end")
+                continue
+
+            dash_pos = line.find("--")
+            if dash_pos != -1:
+                before_dash = line[:dash_pos]
+                self._highlight_line(line_idx + 1, 0, before_dash)
+                self.sql_text.tag_add("comment", f"{line_idx + 1}.{dash_pos}", f"{line_idx + 1}.end")
+            else:
+                self._highlight_line(line_idx + 1, 0, line)
+
+    def _highlight_line(self, line_num, col_offset, line):
+        patterns = [
+            (r"'(?:[^'\\]|\\.)*'", "string"),
+            (r'"(?:[^"\\]|\\.)*"', "string"),
+            (r"\b\d+\.?\d*\b", "number"),
+            (r"\b[A-Za-z_][A-Za-z0-9_]*\b", "keyword"),
+        ]
+
+        matched_ranges = []
+
+        for pattern, tag_name in patterns:
+            for m in re.finditer(pattern, line):
+                overlap = False
+                for start, end in matched_ranges:
+                    if not (m.end() <= start or m.start() >= end):
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+
+                start = f"{line_num}.{col_offset + m.start()}"
+                end = f"{line_num}.{col_offset + m.end()}"
+                text = m.group()
+
+                if tag_name == "keyword":
+                    if text.upper() in SQL_KEYWORDS:
+                        self.sql_text.tag_add("keyword", start, end)
+                        matched_ranges.append((m.start(), m.end()))
+                else:
+                    self.sql_text.tag_add(tag_name, start, end)
+                    matched_ranges.append((m.start(), m.end()))
+
+        if self.db.is_connected():
+            try:
+                tables = self.db.get_tables()
+                for tbl in tables:
+                    escaped = re.escape(tbl)
+                    for m in re.finditer(r'\b' + escaped + r'\b', line, re.IGNORECASE):
+                        overlap = False
+                        for start, end in matched_ranges:
+                            if not (m.end() <= start or m.start() >= end):
+                                overlap = True
+                                break
+                        if overlap:
+                            continue
+                        start = f"{line_num}.{col_offset + m.start()}"
+                        end = f"{line_num}.{col_offset + m.end()}"
+                        self.sql_text.tag_add("table_ref", start, end)
+            except Exception:
+                pass
+
+    def _on_sql_key_release(self, event):
+        if event.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R",
+                            "Alt_L", "Alt_R", "Caps_Lock", "Tab", "Escape"):
+            return
+
+        self._apply_syntax_highlight()
+
+        if event.keysym == "period":
+            self.root.after(10, lambda: self._show_completion(event))
+        else:
+            self._show_completion(event)
+
+    def _on_sql_focus_out(self, event):
+        self.root.after(200, self._hide_completion)
+
+    def _get_completion_context(self):
+        cursor_pos = self.sql_text.index(tk.INSERT)
+        line_num, col_num = map(int, cursor_pos.split("."))
+        line = self.sql_text.get(f"{line_num}.0", f"{line_num}.end")
+        text_before = line[:col_num]
+
+        m = re.search(r'([A-Za-z_][A-Za-z0-9_]*)$', text_before)
+        current_word = None
+        start_col = col_num
+
+        if m:
+            current_word = m.group(1)
+            start_col = m.start()
+
+        dot_prefix = None
+        before_word = text_before[:start_col].rstrip()
+        if before_word.endswith("."):
+            dm = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*\.$', before_word)
+            if dm:
+                dot_prefix = dm.group(1)
+                if current_word is None:
+                    current_word = ""
+                    start_col = col_num
+
+        return current_word, start_col, dot_prefix
+
+    def _get_completion_items(self, prefix, dot_prefix):
+        items = []
+
+        if dot_prefix:
+            if self.db.is_connected():
+                try:
+                    tables = self.db.get_tables()
+                    matched_table = None
+                    for tbl in tables:
+                        if tbl.lower() == dot_prefix.lower():
+                            matched_table = tbl
+                            break
+                    if matched_table:
+                        cols, _ = self.db.get_table_columns(matched_table)
+                        for col in cols:
+                            items.append(("column", col["name"], matched_table))
+                except Exception:
+                    pass
+        else:
+            if self.db.is_connected():
+                try:
+                    tables = self.db.get_tables()
+                    for tbl in tables:
+                        items.append(("table", tbl, None))
+                    views = self.db.get_views()
+                    for vw in views:
+                        items.append(("view", vw, None))
+                except Exception:
+                    pass
+
+            for kw in SQL_KEYWORDS:
+                items.append(("keyword", kw, None))
+
+        prefix_lower = prefix.lower()
+        filtered = [(t, n, s) for t, n, s in items if n.lower().startswith(prefix_lower)]
+        filtered.sort(key=lambda x: (0 if x[0] in ("table", "view") else 1, x[1].lower()))
+        return filtered
+
+    def _show_completion(self, event):
+        if event.keysym in ("Up", "Down", "Escape"):
+            return
+
+        current_word, start_col, dot_prefix = self._get_completion_context()
+        if current_word is None:
+            self._hide_completion()
+            return
+
+        candidates = self._get_completion_items(current_word, dot_prefix)
+        if not candidates:
+            self._hide_completion()
+            return
+
+        self._completion_candidates = candidates
+        self._completion_start = start_col
+
+        if self._completion_window is None:
+            self._create_completion_window()
+
+        self._completion_listbox.delete(0, tk.END)
+        for item_type, name, source in candidates:
+            if item_type == "table":
+                display = f"\U0001F4CB {name}"
+            elif item_type == "view":
+                display = f"\U0001F441 {name}"
+            elif item_type == "column":
+                display = f"\U0001F4CC {name} ({source})"
+            else:
+                display = f"\U0001F527 {name}"
+            self._completion_listbox.insert(tk.END, display)
+
+        self._completion_listbox.selection_set(0)
+        self._completion_listbox.activate(0)
+
+        cursor_pos = self.sql_text.index(tk.INSERT)
+        bbox = self.sql_text.bbox(cursor_pos)
+        if bbox:
+            x = self.sql_text.winfo_rootx() + bbox[0]
+            y = self.sql_text.winfo_rooty() + bbox[1] + bbox[3] + 2
+
+            max_visible = min(len(candidates), 8)
+            height = max_visible * 20 + 4
+            width = 280
+
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            if x + width > screen_w:
+                x = screen_w - width
+            if y + height > screen_h:
+                y = self.sql_text.winfo_rooty() + bbox[1] - height
+
+            self._completion_window.geometry(f"{width}x{height}+{x}+{y}")
+            self._completion_window.deiconify()
+            self._completion_window.lift()
+
+    def _create_completion_window(self):
+        self._completion_window = tk.Toplevel(self.root)
+        self._completion_window.wm_overrideredirect(True)
+        self._completion_window.attributes("-topmost", True)
+        self._completion_window.withdraw()
+
+        frame = ttk.Frame(self._completion_window, borderwidth=1, relief="solid")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self._completion_listbox = tk.Listbox(
+            frame, font=("Consolas", 9), selectmode=tk.SINGLE,
+            activestyle="none", height=8, width=35,
+            bg="#FFFFFF", fg="#000000", selectbackground="#0078D7",
+            selectforeground="#FFFFFF", relief="flat", highlightthickness=0
+        )
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self._completion_listbox.yview)
+        self._completion_listbox.configure(yscrollcommand=scrollbar.set)
+        self._completion_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self._completion_listbox.bind("<ButtonRelease-1>", self._on_completion_click)
+        self._completion_listbox.bind("<Double-Button-1>", self._on_completion_double_click)
+
+    def _hide_completion(self):
+        if self._completion_window:
+            self._completion_window.withdraw()
+
+    def _insert_completion(self, index):
+        if not self._completion_candidates or index < 0 or index >= len(self._completion_candidates):
+            return
+
+        item_type, name, source = self._completion_candidates[index]
+        cursor_pos = self.sql_text.index(tk.INSERT)
+        line_num = int(cursor_pos.split(".")[0])
+        start_pos = f"{line_num}.{self._completion_start}"
+        end_pos = cursor_pos
+
+        self.sql_text.delete(start_pos, end_pos)
+        self.sql_text.insert(start_pos, name)
+
+        if item_type == "keyword" and name.upper() in ("SELECT", "FROM", "WHERE", "INSERT", "INTO", 
+                                                       "UPDATE", "SET", "DELETE", "CREATE", "TABLE",
+                                                       "DROP", "ALTER", "ADD", "JOIN", "INNER", 
+                                                       "LEFT", "RIGHT", "OUTER", "ON", "AND", "OR",
+                                                       "NOT", "IN", "IS", "LIKE", "BETWEEN", "EXISTS",
+                                                       "DISTINCT", "AS", "ORDER", "BY", "GROUP", 
+                                                       "HAVING", "LIMIT", "OFFSET", "UNION", "VALUES"):
+            self.sql_text.insert(self.sql_text.index(tk.INSERT), " ")
+
+        self._hide_completion()
+        self._apply_syntax_highlight()
+
+    def _on_completion_click(self, event):
+        selection = self._completion_listbox.curselection()
+        if selection:
+            self._insert_completion(selection[0])
+
+    def _on_completion_double_click(self, event):
+        selection = self._completion_listbox.curselection()
+        if selection:
+            self._insert_completion(selection[0])
+
+    def _on_completion_tab(self, event):
+        if self._completion_window and self._completion_window.winfo_viewable():
+            selection = self._completion_listbox.curselection()
+            if selection:
+                self._insert_completion(selection[0])
+            return "break"
+        return None
+
+    def _on_completion_return(self, event):
+        if self._completion_window and self._completion_window.winfo_viewable():
+            selection = self._completion_listbox.curselection()
+            if selection:
+                self._insert_completion(selection[0])
+                return "break"
+        return None
+
+    def _on_completion_up(self, event):
+        if self._completion_window and self._completion_window.winfo_viewable():
+            selection = self._completion_listbox.curselection()
+            if selection:
+                idx = selection[0] - 1
+                if idx >= 0:
+                    self._completion_listbox.selection_clear(0, tk.END)
+                    self._completion_listbox.selection_set(idx)
+                    self._completion_listbox.activate(idx)
+                    self._completion_listbox.see(idx)
+            return "break"
+        return None
+
+    def _on_completion_down(self, event):
+        if self._completion_window and self._completion_window.winfo_viewable():
+            selection = self._completion_listbox.curselection()
+            if selection:
+                idx = selection[0] + 1
+                if idx < self._completion_listbox.size():
+                    self._completion_listbox.selection_clear(0, tk.END)
+                    self._completion_listbox.selection_set(idx)
+                    self._completion_listbox.activate(idx)
+                    self._completion_listbox.see(idx)
+            return "break"
+        return None
+
+    def _on_completion_escape(self, event):
+        if self._completion_window and self._completion_window.winfo_viewable():
+            self._hide_completion()
+            return "break"
+        return None
 
     def create_data_table(self, parent):
         table_frame = ttk.Frame(parent)
